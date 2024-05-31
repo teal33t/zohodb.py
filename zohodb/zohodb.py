@@ -1,16 +1,7 @@
-#
-# ZohoDB.py
-#
-# @oddmario
-# Mario
-# mariolatif741@yandex.com
-#
-# License: GNU GPLv3
-
 import os
 import httpx
 import json
-import urllib.parse
+
 import hashlib
 import calendar
 import time
@@ -18,9 +9,9 @@ from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 
 ZOHO_OAUTH_API_BASE = "https://accounts.zoho.com/oauth/v2"
+ZOHO_OAUTHV3_API_BASE = "https://accounts.zoho.com/oauth/v3"
 ZOHO_SHEETS_API_BASE = "https://sheet.zoho.com/api/v2"
 
-# ----- Exception classes -----
 class EmptyInput(Exception):
     """Thrown when an argument value is empty"""
     pass
@@ -38,7 +29,7 @@ class UnexpectedResponse(Exception):
     pass
 
 class HttpRequestError(Exception):
-    """Thrown on the occurence of a HttpX request error"""
+    """Thrown on the occurrence of an HttpX request error"""
     pass
 
 class MissingData(Exception):
@@ -61,11 +52,11 @@ def ZohoWorkbookRequest(workbook_id, data):
     del data['access_token']
     try:
         return httpx.post(f"{ZOHO_SHEETS_API_BASE}/{workbook_id}", data=data, headers={
-            "Authorization": f"Bearer {token}"
+            "Authorization": f"Zoho-oauthtoken {token}"
         })
     except httpx.RequestError as e:
         raise HttpRequestError(f"A Zoho workbook request has failed: {e}")
-        
+
 class ZohoDBCache:
     def __init__(self, hash):
         if not hash:
@@ -73,7 +64,7 @@ class ZohoDBCache:
         self.hash = hash
         self.cache_path = f"./.zohodb/db_cache/{self.hash}"
         Path(f"{self.cache_path}").mkdir(parents=True, exist_ok=True)
-        
+
     def __wait_till_released(self, table):
         while True:
             if Path(f"{self.cache_path}/{table}.lock").exists():
@@ -82,16 +73,16 @@ class ZohoDBCache:
             else:
                 break
         return True
-        
+
     def __lock(self, table):
         open(f"{self.cache_path}/{table}.lock", 'a').close()
         return True
-        
+
     def __release(self, table):
         if Path(f"{self.cache_path}/{table}.lock").exists():
             os.remove(f"{self.cache_path}/{table}.lock")
         return True
-            
+
     def __release_and_return(self, return_value, table):
         self.__release(table)
         return return_value
@@ -116,7 +107,7 @@ class ZohoDBCache:
                 fw.write(json.dumps(data))
                 return self.__release_and_return(True, table)
         return self.__release_and_return(False, table)
-                
+
     def get(self, table, key):
         if not Path(f"{self.cache_path}/{table}.json").exists():
             raise InvalidCacheTable
@@ -129,7 +120,7 @@ class ZohoDBCache:
                 return data[key]
             else:
                 return None
-                
+
     def delete(self, table, key):
         if not Path(f"{self.cache_path}/{table}.json").exists():
             raise InvalidCacheTable
@@ -150,6 +141,7 @@ class ZohoDBCache:
                 return self.__release_and_return(True, table)
         return self.__release_and_return(False, table)
 
+
 class ZohoAuthHandler:
     def __init__(self, client_id, client_secret):
         self.client_id = client_id
@@ -161,38 +153,42 @@ class ZohoAuthHandler:
         Path(f"{self.cache_path}").mkdir(parents=True, exist_ok=True)
     
     def __fetch_token(self):
-        redirecturi = urllib.parse.quote_plus("https://example.com")
-        request_code_params = [
-            "response_type=code",
-            f"client_id={self.client_id}",
-            "scope=ZohoSheet.dataAPI.UPDATE,ZohoSheet.dataAPI.READ",
-            f"redirect_uri={redirecturi}",
-            "access_type=offline",
-            "prompt=consent"
-        ]
-        print(f"Please visit this URL: {ZOHO_OAUTH_API_BASE}/auth?" + "&".join(request_code_params))
-        url = input("Paste the URL you've been redirected to after authorizing the app here (be fast here before the code expires): ")
-        urlparams = url.split("/")[3].split("&")
-        code = ""
-        for param in urlparams:
-            try:
-                key = param.split("=")[0]
-                val = param.split("=")[1]
-                if key == 'code' or key == '?code':
-                    code = val
-                    break
-            except IndexError:
-                continue
+        
+        request_code_params = {
+            "client_id": self.client_id,
+            "scope": "ZohoSheet.dataAPI.UPDATE,ZohoSheet.dataAPI.READ",
+            "grant_type": "device_request",
+            "access_type": "offline"
+        }
+
+        try:
+            response = httpx.post(f"{ZOHO_OAUTHV3_API_BASE}/device/code", data=request_code_params)
+        except httpx.RequestError as e:
+            raise HttpRequestError(f"Failed to request device code: {e}")
+
+        print(response.json())
+        
+        try:
+            code_data = response.json()
+        except ValueError as e:
+            raise InvalidJsonResponse(f"Failed to parse the device code response: {e}")
+
+
+        print(f"Please visit this URL and enter the code: {code_data['verification_url']}")
+        print(f"User Code: {code_data['user_code']}")
+        
+        input("Press Enter after you have authorized the device...")
+
+                
         request_token_params = [
-            f"code={code}",
+            f"code={code_data['device_code']}",
             f"client_id={self.client_id}",
             f"client_secret={self.client_secret}",
-            f"redirect_uri={redirecturi}",
-            "grant_type=authorization_code"
+            "grant_type=device_token"
         ]
         ts = calendar.timegm(time.gmtime())
         try:
-            tokenreq = httpx.post(f"{ZOHO_OAUTH_API_BASE}/token?" + "&".join(request_token_params))
+            tokenreq = httpx.post(f"{ZOHO_OAUTHV3_API_BASE}/device/token?" + "&".join(request_token_params))
         except httpx.RequestError as e:
             raise HttpRequestError(f"Failed to request an access token: {e}")
         try:
@@ -244,6 +240,8 @@ class ZohoAuthHandler:
             if (int(data['created_at']) + int(data['expires_in'])) <= calendar.timegm(time.gmtime()):
                 return self.__refresh_token(data['refresh_token'])
             return data['access_token']
+            
+            
 
 class ZohoDB:
     def __init__(self, AuthHandler, workbooks, max_threads = 24):
@@ -264,7 +262,7 @@ class ZohoDB:
         try:
             req = httpx.get(f"{ZOHO_SHEETS_API_BASE}/workbooks?method=workbook.list",
             headers={
-                "Authorization": f"Bearer {self.AuthHandler.token()}"
+                "Authorization": f"Zoho-oauthtoken {self.AuthHandler.token()}"
             })
         except httpx.RequestError as e:
             raise HttpRequestError(f"Failed to fetch the workbook(s) ID(s): {e}")
@@ -278,7 +276,7 @@ class ZohoDB:
             raise UnexpectedResponse("Unable to find any workbooks with the name(s) specified")
         self.cache.set("workbooks", "workbooks", workbookids)
         return workbookids
-        
+
     def workbookids(self):
         try:
             wbs = self.cache.get("workbooks", "workbooks")
@@ -287,14 +285,14 @@ class ZohoDB:
         if wbs == None or len(wbs) <= 0:
             return self.__fetch_workbooks()
         return wbs
-            
+
     def escape(self, criteria, parameters):
         for k, v in parameters.items():
             k = k.strip()
             v = str(v).replace("\"", "'")
             criteria = criteria.replace(k, v)
         return criteria
-     
+
     def select(self, **kwargs):
         requireds = [
             "table",
@@ -328,7 +326,7 @@ class ZohoDB:
                 raise UnexpectedResponse(res['error_message'])
             returned.extend([dict(record, **{'workbook_id': workbookids[index]}) for record in res['records']])
         return returned
-        
+
     def insert(self, **kwargs):
         requireds = [
             "table",
@@ -367,7 +365,7 @@ class ZohoDB:
                 raise UnexpectedResponse(res['error_message'])
             return True
         return False
-        
+
     def update(self, **kwargs):
         requireds = [
             "table",
@@ -389,7 +387,7 @@ class ZohoDB:
         return_bool = False
         if workbook_id and workbook_id != "":
             req = ZohoWorkbookRequest(workbook_id, {
-                "access_token": self.AuthHandler.token(),
+                "access_token": self.auth_handler.token(),
                 "method": "worksheet.records.update",
                 "worksheet_name": table,
                 "criteria": criteria,
@@ -418,7 +416,7 @@ class ZohoDB:
                 if res['no_of_affected_rows'] >= 1:
                     return_bool = True
         return return_bool
-        
+
     def delete(self, **kwargs):
         requireds = [
             "table",
